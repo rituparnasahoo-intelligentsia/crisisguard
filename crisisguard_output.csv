@@ -1,0 +1,5 @@
+Allocation ID,Patient ID,Patient Name,Incident ID,Resource Type,Resource ID
+1,PT-001,Patient One (fictional),INC-001,bed,B-H01-ICU-01
+1,PT-001,Patient One (fictional),INC-001,doctor,D02
+1,PT-001,Patient One (fictional),INC-001,equipment,VENT-H01-01
+1,PT-001,Patient One (fictional),INC-001,nurse,N01

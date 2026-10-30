@@ -1,0 +1,2289 @@
+
+
+========================================
+FILE: docker-compose.yml
+========================================
+# PostgreSQL for the CrisisGuard AI demo (fictional data only).
+# Values come from your local .env file (copy .env.example to .env first).
+#
+# Three different things live here - do not mix them up:
+#   container : the running PostgreSQL program (can be deleted and recreated safely)
+#   volume    : the disk storage holding the data (survives container restarts)
+#   schema    : the tables, created by migrations (python -m scripts.init_db), not by Docker
+services:
+  db:
+    image: postgres:16
+    container_name: crisisguard-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      # Bound to 127.0.0.1 so only your own computer can reach the database.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Named volume: data survives `docker compose down` and container restarts.
+      - crisisguard_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # The FastAPI service is added in the API phase. It will wait for the database like this:
+  #
+  # api:
+  #   build: .
+  #   env_file: .env
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+
+volumes:
+  crisisguard_pgdata:
+
+
+
+========================================
+FILE: project_files.txt
+========================================
+D:\crisisguard-ai\.env.example
+D:\crisisguard-ai\.gitignore
+D:\crisisguard-ai\docker-compose.yml
+D:\crisisguard-ai\project_files.txt
+D:\crisisguard-ai\pytest.ini
+D:\crisisguard-ai\README.md
+D:\crisisguard-ai\requirements.txt
+D:\crisisguard-ai\backend\approval.py
+D:\crisisguard-ai\backend\database.py
+D:\crisisguard-ai\backend\evaluation.py
+D:\crisisguard-ai\backend\hospital_state.py
+D:\crisisguard-ai\backend\schemas.py
+D:\crisisguard-ai\backend\seed.sql
+D:\crisisguard-ai\backend\validator.py
+D:\crisisguard-ai\backend\__init__.py
+D:\crisisguard-ai\backend\migrations\001_nurse_only_baseline.sql
+D:\crisisguard-ai\backend\migrations\002_hospital_wide.sql
+D:\crisisguard-ai\docs\erd.md
+D:\crisisguard-ai\scripts\db_tools.py
+D:\crisisguard-ai\scripts\init_db.py
+D:\crisisguard-ai\scripts\migrate.py
+D:\crisisguard-ai\scripts\reset_demo.py
+D:\crisisguard-ai\scripts\__init__.py
+D:\crisisguard-ai\tests\conftest.py
+D:\crisisguard-ai\tests\test_approval.py
+D:\crisisguard-ai\tests\test_scenarios.py
+D:\crisisguard-ai\tests\test_schema.py
+D:\crisisguard-ai\tests\test_validator.py
+D:\crisisguard-ai\tests\__init__.py
+
+
+
+========================================
+FILE: README.md
+========================================
+# CrisisGuard AI - hospital-wide resource coordination (backend, Phases 1-3)
+
+A **fictional-data prototype** of a human-supervised hospital emergency coordination flow:
+an AI *proposes* resource assignments, deterministic Python *validates* them, a human
+*reviews* them, and only then are changes committed to PostgreSQL.
+
+> **Not a medical device.** Simulated data only. Not clinically validated; must not be used in
+> a real hospital or with real patient or staff data. Clinical policy and ICU placement rules
+> in this repo are **demo placeholders** that real deployments would need qualified clinicians to define.
+
+## Status
+
+| Phase | Content | State |
+|---|---|---|
+| 1 | Audit of the nurse-only project | Done |
+| 2 | Hospital-wide entity design | Done: `docs/erd.md` |
+| 3 | Migrations, Docker, fictional seed data | Done and tested (below) |
+| 4+ | State retrieval, multi-resource validator and approval, AI agents, API, simulator, React | Not built yet |
+
+The original **nurse-only workflow still works** (`validator.py`, `approval.py`, all original
+tests). It will be replaced by the bundle workflow in later phases.
+
+Test status when this was packaged: **51 passed** (28 original + 23 schema tests) against a
+throwaway PostgreSQL 16 server. The Docker Compose file and the Windows commands below have
+not been run by the author of this package; confirm them on your machine.
+
+---
+
+## 1. Quick start (Windows PowerShell, Python 3.12, Docker Desktop)
+
+```powershell
+# 1. Virtual environment and dependencies
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1          # if blocked: Set-ExecutionPolicy -Scope Process Bypass
+pip install -r requirements.txt
+
+# 2. Local config (then open .env and change the password in BOTH places)
+Copy-Item .env.example .env
+
+# 3. Start PostgreSQL and wait until it says (healthy)
+docker compose up -d
+docker compose ps
+
+# 4. Create the separate TEST database (used only by pytest)
+docker compose exec db psql -U crisisguard -d crisisguard -c "CREATE DATABASE crisisguard_test;"
+
+# 5. Create/upgrade the tables and insert the fictional data
+python -m scripts.init_db
+
+# 6. Verify
+pytest
+```
+
+Expected output of step 5 on a fresh database: `Applied migrations: 001_nurse_only_baseline.sql,
+002_hospital_wide.sql`, then row counts: hospitals 2, wards 6, beds 25, nurses 6, doctors 6,
+equipment_units 8, patients 3, incidents 2, and 0 for proposals, allocations and audit logs.
+Running it again prints `none (already up to date)` and changes nothing.
+
+### Upgrading a database from the earlier nurse-only version
+
+1. **Back it up first** (the upgrade alters existing tables):
+   ```powershell
+   docker compose exec db pg_dump -U crisisguard crisisguard > backup_before_upgrade.sql
+   ```
+2. Replace the project files, then run `python -m scripts.init_db`.
+3. Existing nurses move into hospital `H01` with shift `day`; existing proposals, approvals and
+   audit rows are kept unchanged and the old workflow keeps working.
+
+### Inspecting the data
+
+```powershell
+docker compose exec db psql -U crisisguard -d crisisguard
+```
+Inside `psql`: `\dt` (tables), `\d beds` (describe), `\q` (quit), and for example:
+
+```sql
+SELECT hospital_id, name, operational_status, max_concurrent_patients FROM hospitals;
+SELECT ward_id, ward_type, capacity FROM wards ORDER BY ward_id;
+SELECT status, count(*) FROM beds GROUP BY status;
+SELECT unit_id, status FROM equipment_units WHERE status <> 'available';
+SELECT version, applied_at FROM schema_migrations ORDER BY version;
+```
+
+### Docker commands
+
+| Goal | Command |
+|---|---|
+| Start | `docker compose up -d` |
+| Stop (data kept) | `docker compose down` |
+| Status / health | `docker compose ps` |
+| Logs | `docker compose logs db` |
+| **Delete all data** (removes the volume) | `docker compose down -v` - **destructive and permanent; only if you truly want a blank database** |
+
+## 2. Container, volume, schema, seed, runtime inserts: what is what
+
+| Concept | What it is | Where it comes from |
+|---|---|---|
+| Container | The running PostgreSQL program | `docker compose up` |
+| Persistent volume | Disk storage holding the database files; survives container restarts | Named volume in `docker-compose.yml` |
+| Schema | Tables, constraints, indexes | Migration files, applied by `python -m scripts.migrate` / `init_db` |
+| Seed data | The initial fictional demo records | `backend/seed.sql` (safe to re-run, never overwrites) |
+| Runtime inserts | New patients, resources and proposals during operation | API endpoints (later phase), never hand-written SQL |
+
+## 3. Changing the schema safely
+
+1. **Never edit** an applied migration. The runner stores a checksum and refuses to continue if an applied file changed.
+2. Add the next numbered file, for example `backend/migrations/003_add_something.sql`. Write changes as `ALTER TABLE ...` (migrations are applied once, in order, each in its own transaction).
+3. Back up with `pg_dump`, run `python -m scripts.init_db`, then `pytest`.
+4. For a deliberate wipe of demo data (structure kept): `python -m scripts.reset_demo` (shows counts, requires typing `RESET`).
+
+## 4. Project layout
+
+```
+backend/
+  migrations/       001_nurse_only_baseline.sql, 002_hospital_wide.sql
+  seed.sql          fictional demo data
+  schemas.py, database.py, hospital_state.py, validator.py, approval.py, evaluation.py   (nurse-only workflow, still working)
+scripts/            migrate.py, init_db.py, reset_demo.py, db_tools.py
+tests/              test_validator.py, test_approval.py, test_scenarios.py, test_schema.py
+docs/erd.md         entity relationship diagram and rule table
+docker-compose.yml, .env.example, .gitignore, pytest.ini, requirements.txt
+```
+
+## 5. Tests
+
+- **Unit tests** need no database. **Integration tests** (marked `integration`) use `TEST_DATABASE_URL`, apply the real migrations, then empty and re-seed every table before each test. They refuse to run unless the database name ends in `_test` and differs from `DATABASE_URL`. Without PostgreSQL they are skipped.
+- `tests/test_schema.py` proves the database itself rejects invalid states: cross-hospital resources, over-capacity wards, double-booked beds and equipment, one active allocation per patient, malformed allocation items, non-fictional patients, and edits to audit rows. It also covers migration repeatability and detection of edited migrations.
+
+## 6. Open decisions for you and your teammates
+
+1. The design here uses my recommended choices: two hospitals, individually tracked equipment units, one allocation bundle per patient, per-row versions, JWT roles (administrator, reviewer) in a later phase. Confirm or change them before Phase 4.
+2. `schemas.py` is shared with Persons A and C and will change substantially from Phase 5 onward.
+3. `policy_settings` holds **demo placeholder** values (including the ICU rule). Real values need qualified clinical input.
+4. The API database role should later be restricted (no `TRUNCATE`) so audit protection is complete.
+
+
+
+========================================
+FILE: requirements.txt
+========================================
+psycopg[binary]>=3.2,<4
+pydantic>=2.7,<3
+python-dotenv>=1.0
+pytest>=8.0
+
+
+
+========================================
+FILE: backend\approval.py
+========================================
+"""Human approval and the safe commit.
+
+Chosen technique: a CONDITIONAL UPDATE inside a transaction (plus a row lock on the
+proposal). In plain English:
+
+  - A transaction is an all-or-nothing group of database steps.
+  - The nurse UPDATE has a WHERE clause: "only if still available AND still at the
+    version the proposal was validated against". If someone else changed the nurse
+    first, the UPDATE changes 0 rows and we know the proposal is stale.
+  - If two approvals race, PostgreSQL makes the second UPDATE wait for the first to
+    finish, then re-checks the WHERE clause against the new data, so it changes 0 rows.
+  - `SELECT ... FOR UPDATE` on the proposal makes a double-click on the SAME proposal
+    queue up, and the second attempt sees the status is no longer 'pending_review'.
+"""
+
+from backend import database
+from backend.hospital_state import is_state_current
+from backend.schemas import ApprovalResult
+
+
+def _rejected(proposal_id: str, reason: str, nurse_id=None) -> ApprovalResult:
+    return ApprovalResult(proposal_id=proposal_id, outcome="rejected", reason=reason, nurse_id=nurse_id)
+
+
+def approve_proposal(conn, proposal_id: str, reviewer: str, reason: str = "") -> ApprovalResult:
+    """Reviewer approves. Returns outcome 'committed', 'rejected' or 'stale'.
+
+    If any database step raises an error, the whole transaction rolls back and the
+    exception is re-raised: nothing is half-applied.
+    """
+    if not reviewer.strip():
+        raise ValueError("Reviewer name is required.")
+
+    with conn.transaction():
+        proposal = database.get_proposal(conn, proposal_id, for_update=True)
+        if proposal is None:
+            return _rejected(proposal_id, "Proposal not found.")
+
+        nurse_id = proposal["proposed_nurse_id"]
+
+        # Only a proposal still waiting for review can be decided; this blocks repeats.
+        if proposal["status"] != "pending_review":
+            database.add_audit_event(conn, "approval_blocked", proposal_id, {
+                "reviewer": reviewer, "reason": f"status is {proposal['status']}"})
+            return _rejected(
+                proposal_id,
+                f"Proposal cannot be approved: status is {proposal['status']}.",
+                nurse_id,
+            )
+
+        # Defence in depth: an invalid proposal can never be approved by a click.
+        saved_version = proposal["state_version_used"]
+        if not proposal["validation_valid"] or saved_version is None:
+            database.add_audit_event(conn, "approval_blocked", proposal_id, {
+                "reviewer": reviewer, "reason": "proposal did not pass validation"})
+            return _rejected(proposal_id, "Proposal did not pass validation.", nurse_id)
+
+        # The safe commit: change the nurse only if nothing has changed since validation.
+        new_version = database.mark_nurse_assigned(conn, nurse_id, saved_version)
+
+        if new_version is None:
+            nurse = database.get_nurse(conn, nurse_id)
+            current_version = nurse["state_version"] if nurse else None
+            if nurse is None:
+                why = f"Nurse {nurse_id} no longer exists."
+            elif not is_state_current(saved_version, current_version):
+                why = (f"State changed since validation "
+                       f"(validated at version {saved_version}, now version {current_version}).")
+            else:
+                why = f"Nurse {nurse_id} is no longer available."
+            database.set_proposal_status(conn, proposal_id, "stale")
+            database.add_audit_event(conn, "approval_failed_stale", proposal_id, {
+                "reviewer": reviewer, "reason": why,
+                "saved_version": saved_version, "current_version": current_version})
+            return ApprovalResult(
+                proposal_id=proposal_id, outcome="stale", reason=why, nurse_id=nurse_id)
+
+        # Success path: all of these are committed together, or none of them are.
+        database.record_approval(conn, proposal_id, reviewer, "approved", reason)
+        database.set_proposal_status(conn, proposal_id, "approved")
+        database.add_audit_event(conn, "reviewer_approved", proposal_id, {
+            "reviewer": reviewer, "reason": reason})
+        database.add_audit_event(conn, "assignment_committed", proposal_id, {
+            "nurse_id": nurse_id, "new_state_version": new_version})
+        return ApprovalResult(
+            proposal_id=proposal_id,
+            outcome="committed",
+            reason=f"Nurse {nurse_id} assigned.",
+            nurse_id=nurse_id,
+            new_state_version=new_version,
+        )
+
+
+def reject_proposal(conn, proposal_id: str, reviewer: str, reason: str = "") -> ApprovalResult:
+    """Reviewer rejects. The nurse is never changed."""
+    if not reviewer.strip():
+        raise ValueError("Reviewer name is required.")
+
+    with conn.transaction():
+        proposal = database.get_proposal(conn, proposal_id, for_update=True)
+        if proposal is None:
+            return _rejected(proposal_id, "Proposal not found.")
+
+        nurse_id = proposal["proposed_nurse_id"]
+        if proposal["status"] != "pending_review":
+            database.add_audit_event(conn, "rejection_blocked", proposal_id, {
+                "reviewer": reviewer, "reason": f"status is {proposal['status']}"})
+            return _rejected(
+                proposal_id,
+                f"Proposal cannot be rejected: status is {proposal['status']}.",
+                nurse_id,
+            )
+
+        database.record_approval(conn, proposal_id, reviewer, "rejected", reason)
+        database.set_proposal_status(conn, proposal_id, "rejected_by_reviewer")
+        database.add_audit_event(conn, "reviewer_rejected", proposal_id, {
+            "reviewer": reviewer, "reason": reason})
+        return _rejected(proposal_id, "Rejected by reviewer.", nurse_id)
+
+
+
+========================================
+FILE: backend\database.py
+========================================
+"""Database access layer (PostgreSQL via psycopg 3).
+
+Conventions used everywhere in this file:
+- Every function takes `conn` (an open connection) as its first argument, so
+  several calls can share ONE transaction.
+- Connections are opened with autocommit=True. A multi-step change is wrapped in
+  `with conn.transaction():` (see approval.py), which is an explicit
+  BEGIN ... COMMIT block that rolls back automatically if an error happens.
+- SQL uses %s placeholders and passes values separately. Values are never pasted
+  into the SQL text, which prevents SQL injection.
+- Rows come back as dictionaries (dict_row), e.g. nurse["available"].
+"""
+
+import os
+from typing import Optional
+
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+load_dotenv()  # reads the .env file in the project folder, if present
+
+
+def get_connection(database_url: Optional[str] = None) -> psycopg.Connection:
+    """Open a connection. Use it as: `with get_connection() as conn: ...`
+    (the `with` block closes the connection for you)."""
+    url = database_url or os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and edit it.")
+    return psycopg.connect(url, autocommit=True, row_factory=dict_row)
+
+
+# ---------------------------------------------------------------- nurses (reads)
+
+_NURSE_COLUMNS = "nurse_id, name, available, department, state_version"
+
+
+def get_nurse(conn, nurse_id: str) -> Optional[dict]:
+    """Return one nurse as a dict, or None if no such nurse exists."""
+    cur = conn.execute(
+        f"SELECT {_NURSE_COLUMNS} FROM nurses WHERE nurse_id = %s", (nurse_id,)
+    )
+    return cur.fetchone()
+
+
+def list_nurses(conn) -> list[dict]:
+    cur = conn.execute(f"SELECT {_NURSE_COLUMNS} FROM nurses ORDER BY nurse_id")
+    return cur.fetchall()
+
+
+def list_available_nurses(conn) -> list[dict]:
+    cur = conn.execute(
+        f"SELECT {_NURSE_COLUMNS} FROM nurses WHERE available = TRUE ORDER BY nurse_id"
+    )
+    return cur.fetchall()
+
+
+def get_state_version(conn, nurse_id: str) -> Optional[int]:
+    """Current state version of one nurse, or None if the nurse does not exist."""
+    cur = conn.execute("SELECT state_version FROM nurses WHERE nurse_id = %s", (nurse_id,))
+    row = cur.fetchone()
+    return row["state_version"] if row else None
+
+
+# ------------------------------------------------------------ nurses (the one write)
+
+def mark_nurse_assigned(conn, nurse_id: str, expected_version: int) -> Optional[int]:
+    """Conditionally mark a nurse unavailable.
+
+    The UPDATE only changes the row if the nurse is STILL available AND still at
+    the version the proposal was validated against. Check and change happen in a
+    single statement, so two people cannot both succeed.
+
+    Returns the new state version if the row was changed, or None if it was not
+    (meaning the proposal is stale).
+    """
+    cur = conn.execute(
+        """
+        UPDATE nurses
+           SET available = FALSE,
+               state_version = state_version + 1
+         WHERE nurse_id = %s
+           AND available = TRUE
+           AND state_version = %s
+        RETURNING state_version
+        """,
+        (nurse_id, expected_version),
+    )
+    row = cur.fetchone()
+    return row["state_version"] if row else None
+
+
+# ---------------------------------------------------------------------- proposals
+
+_PROPOSAL_COLUMNS = (
+    "proposal_id, incident_description, proposed_nurse_id, validation_valid, "
+    "validation_reason, state_version_used, status, created_at"
+)
+
+
+def save_proposal(
+    conn,
+    *,
+    proposal_id: str,
+    incident_description: str,
+    proposed_nurse_id: str,
+    valid: bool,
+    reason: str,
+    state_version_used: Optional[int],
+    status: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO proposals
+            (proposal_id, incident_description, proposed_nurse_id,
+             validation_valid, validation_reason, state_version_used, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (proposal_id, incident_description, proposed_nurse_id,
+         valid, reason, state_version_used, status),
+    )
+
+
+def get_proposal(conn, proposal_id: str, for_update: bool = False) -> Optional[dict]:
+    """Return one proposal, or None.
+
+    for_update=True adds `FOR UPDATE`, which LOCKS the row until the surrounding
+    transaction ends. Other transactions that try to lock the same proposal wait.
+    """
+    sql = f"SELECT {_PROPOSAL_COLUMNS} FROM proposals WHERE proposal_id = %s"
+    if for_update:
+        sql += " FOR UPDATE"
+    return conn.execute(sql, (proposal_id,)).fetchone()
+
+
+def set_proposal_status(conn, proposal_id: str, status: str) -> None:
+    conn.execute(
+        "UPDATE proposals SET status = %s WHERE proposal_id = %s", (status, proposal_id)
+    )
+
+
+# ---------------------------------------------------------------------- approvals
+
+def record_approval(conn, proposal_id: str, reviewer: str, decision: str, reason: str) -> int:
+    """Store the reviewer's decision ('approved' or 'rejected'). Returns approval_id."""
+    cur = conn.execute(
+        """
+        INSERT INTO approvals (proposal_id, reviewer, decision, reason)
+        VALUES (%s, %s, %s, %s)
+        RETURNING approval_id
+        """,
+        (proposal_id, reviewer, decision, reason),
+    )
+    return cur.fetchone()["approval_id"]
+
+
+def list_approvals(conn, proposal_id: Optional[str] = None) -> list[dict]:
+    if proposal_id is None:
+        cur = conn.execute("SELECT * FROM approvals ORDER BY approval_id")
+    else:
+        cur = conn.execute(
+            "SELECT * FROM approvals WHERE proposal_id = %s ORDER BY approval_id",
+            (proposal_id,),
+        )
+    return cur.fetchall()
+
+
+# -------------------------------------------------------------------- audit trail
+
+def add_audit_event(conn, action: str, proposal_id: Optional[str], details: dict) -> None:
+    """Append one audit event. `details` must be plain, non-sensitive data
+    (never API keys or secrets). Jsonb() tells psycopg to store the dict as JSON."""
+    conn.execute(
+        "INSERT INTO audit_logs (proposal_id, action, details) VALUES (%s, %s, %s)",
+        (proposal_id, action, Jsonb(details)),
+    )
+
+
+def list_audit_events(conn, proposal_id: Optional[str] = None) -> list[dict]:
+    """All events in order, or only the events for one proposal."""
+    if proposal_id is None:
+        cur = conn.execute("SELECT * FROM audit_logs ORDER BY event_id")
+    else:
+        cur = conn.execute(
+            "SELECT * FROM audit_logs WHERE proposal_id = %s ORDER BY event_id",
+            (proposal_id,),
+        )
+    return cur.fetchall()
+
+
+
+========================================
+FILE: backend\evaluation.py
+========================================
+"""Seeded evaluation scenarios for the validator.
+
+Runs entirely in memory against the three fictional seed nurses, so results are the
+same every time and no database is touched. Run it with:
+
+    python -m backend.evaluation
+
+This checks the prototype's rules on fictional data. It is NOT a clinical validation.
+"""
+
+import sys
+
+from backend.schemas import ProposalInput
+from backend.validator import validate_against_record
+
+# Must match backend/seed.sql (tests/test_scenarios.py checks that they agree).
+SEED_NURSES = {
+    "N01": {"nurse_id": "N01", "name": "Person A", "available": True,  "department": "Emergency", "state_version": 1},
+    "N02": {"nurse_id": "N02", "name": "Person B", "available": False, "department": "ICU",       "state_version": 1},
+    "N03": {"nurse_id": "N03", "name": "Person C", "available": True,  "department": "Emergency", "state_version": 1},
+}
+
+INCIDENT = "Fictional incident: simulated emergency in bay 2."
+
+SCENARIOS = [
+    {"name": "Available Person A",       "nurse_id": "N01", "expect_valid": True,  "expect_text": "exists and is available"},
+    {"name": "Unavailable Person B",     "nurse_id": "N02", "expect_valid": False, "expect_text": "currently unavailable"},
+    {"name": "Available Person C",       "nurse_id": "N03", "expect_valid": True,  "expect_text": "exists and is available"},
+    {"name": "Nonexistent nurse N99",    "nurse_id": "N99", "expect_valid": False, "expect_text": "does not exist"},
+    {"name": "Wrong case (n01)",         "nurse_id": "n01", "expect_valid": False, "expect_text": "does not exist"},
+    {"name": "Blank nurse ID",           "nurse_id": "  ",  "expect_valid": False, "expect_text": "empty"},
+]
+
+
+def run_scenarios() -> list[dict]:
+    """Run every scenario and return one result dict per scenario."""
+    results = []
+    for number, scenario in enumerate(SCENARIOS, start=1):
+        proposal = ProposalInput(
+            proposal_id=f"EVAL-{number}",
+            incident_description=INCIDENT,
+            proposed_nurse_id=scenario["nurse_id"],
+        )
+        outcome = validate_against_record(proposal, SEED_NURSES.get(scenario["nurse_id"]))
+        passed = (outcome.valid == scenario["expect_valid"]
+                  and scenario["expect_text"] in outcome.reason)
+        results.append({"name": scenario["name"], "passed": passed,
+                        "valid": outcome.valid, "reason": outcome.reason})
+    return results
+
+
+def main() -> int:
+    results = run_scenarios()
+    for r in results:
+        print(f"[{'PASS' if r['passed'] else 'FAIL'}] {r['name']}: valid={r['valid']} - {r['reason']}")
+    failed = sum(1 for r in results if not r["passed"])
+    print(f"\n{len(results) - failed}/{len(results)} scenarios passed.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+
+========================================
+FILE: backend\hospital_state.py
+========================================
+"""Resource state: how the rest of the backend reads "what is true right now".
+
+The database is the source of truth. Nothing here caches data in Python.
+
+How state versions work:
+  - Every nurse row has a state_version, starting at 1.
+  - Each time the row changes (a nurse is assigned), the version goes up by 1.
+  - A proposal remembers the version it was validated against.
+  - If the nurse's current version differs from the remembered one, something
+    changed in between, so the proposal is STALE and must not be committed.
+"""
+
+from typing import Optional
+
+from backend import database
+
+
+def get_nurse_state(conn, nurse_id: str) -> Optional[dict]:
+    return database.get_nurse(conn, nurse_id)
+
+
+def get_all_nurse_states(conn) -> list[dict]:
+    return database.list_nurses(conn)
+
+
+def get_available_nurse_states(conn) -> list[dict]:
+    return database.list_available_nurses(conn)
+
+
+def get_state_version(conn, nurse_id: str) -> Optional[int]:
+    return database.get_state_version(conn, nurse_id)
+
+
+def is_state_current(saved_version: Optional[int], current_version: Optional[int]) -> bool:
+    """True only if both versions exist and are equal. A pure function: no database."""
+    return saved_version is not None and saved_version == current_version
+
+
+
+========================================
+FILE: backend\schemas.py
+========================================
+"""Shared data contracts (Pydantic models).
+
+DRAFT: this file is shared with Person A and Person C. Confirm every field name
+with them before treating it as final.
+"""
+
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class ProposalInput(BaseModel):
+    """What Person A's AI code sends us. It does NOT include a state version:
+    any extra field such as "state_version" is ignored, because the backend
+    reads the real version from the database itself."""
+
+    proposal_id: str = Field(min_length=1)
+    incident_description: str
+    proposed_nurse_id: str
+
+
+class ValidationResult(BaseModel):
+    valid: bool
+    reason: str
+    nurse_id: str                       # the nurse ID the AI proposed, exactly as received
+    state_version: Optional[int] = None  # None when the nurse does not exist
+
+
+class ApprovalResult(BaseModel):
+    proposal_id: str
+    outcome: Literal["committed", "rejected", "stale"]
+    reason: str
+    nurse_id: Optional[str] = None
+    new_state_version: Optional[int] = None  # only set when outcome == "committed"
+
+
+
+========================================
+FILE: backend\seed.sql
+========================================
+-- Seed data: FICTIONAL hospitals, staff, beds, equipment, patients and incidents.
+-- No real people, hospitals or patient information. Run AFTER the migrations.
+-- Every insert uses ON CONFLICT DO NOTHING, so running this again never overwrites
+-- or resets rows that already exist (use scripts.reset_demo for a deliberate reset).
+
+INSERT INTO hospitals (hospital_id, name, city, latitude, longitude, operational_status, max_concurrent_patients) VALUES
+    ('H01', 'Riverside General (fictional)',  'Northport', 20.10000, 85.10000, 'operational', 12),
+    ('H02', 'Hillcrest Medical (fictional)',  'Eastvale',  20.20000, 85.30000, 'operational',  8)
+ON CONFLICT (hospital_id) DO NOTHING;
+
+INSERT INTO wards (ward_id, hospital_id, name, ward_type, location_note, capacity, status) VALUES
+    ('W-H01-ED',  'H01', 'Emergency Department', 'emergency', 'Ground floor', 6, 'open'),
+    ('W-H01-ICU', 'H01', 'Intensive Care Unit',  'icu',       'Second floor', 3, 'open'),
+    ('W-H01-GEN', 'H01', 'General Ward',         'general',   'First floor',  6, 'open'),
+    ('W-H02-ED',  'H02', 'Emergency Department', 'emergency', 'Ground floor', 4, 'open'),
+    ('W-H02-ICU', 'H02', 'Intensive Care Unit',  'icu',       'Second floor', 2, 'open'),
+    ('W-H02-GEN', 'H02', 'General Ward',         'general',   'First floor',  4, 'open')
+ON CONFLICT (ward_id) DO NOTHING;
+
+-- Nurses N01-N03 are the original three demo nurses (now in hospital H01).
+INSERT INTO nurses (nurse_id, name, available, department, state_version, hospital_id, shift) VALUES
+    ('N01', 'Person A', TRUE,  'Emergency', 1, 'H01', 'day'),
+    ('N02', 'Person B', FALSE, 'ICU',       1, 'H01', 'day'),
+    ('N03', 'Person C', TRUE,  'Emergency', 1, 'H01', 'day'),
+    ('N04', 'Person D', TRUE,  'Emergency', 1, 'H02', 'day'),
+    ('N05', 'Person E', TRUE,  'ICU',       1, 'H02', 'night'),
+    ('N06', 'Person F', FALSE, 'General',   1, 'H02', 'day')
+ON CONFLICT (nurse_id) DO NOTHING;
+
+INSERT INTO doctors (doctor_id, name, hospital_id, department, specialization, shift, available) VALUES
+    ('D01', 'Doctor A', 'H01', 'Emergency', 'Emergency Medicine', 'day',     TRUE),
+    ('D02', 'Doctor B', 'H01', 'ICU',       'Critical Care',      'day',     TRUE),
+    ('D03', 'Doctor C', 'H01', 'General',   'Internal Medicine',  'evening', FALSE),
+    ('D04', 'Doctor D', 'H02', 'Emergency', 'Emergency Medicine', 'day',     TRUE),
+    ('D05', 'Doctor E', 'H02', 'ICU',       'Critical Care',      'night',   TRUE),
+    ('D06', 'Doctor F', 'H02', 'General',   'Cardiology',         'day',     TRUE)
+ON CONFLICT (doctor_id) DO NOTHING;
+
+-- One bed per ward slot (25 beds). B-H01-ED-06 is out of service and B-H02-GEN-04
+-- is being cleaned, so not every bed is free in the demo.
+INSERT INTO beds (bed_id, hospital_id, ward_id, bed_type, status)
+SELECT 'B-' || w.code || '-' || lpad(n::text, 2, '0'),
+       w.hospital_id, w.ward_id, w.ward_type,
+       CASE 'B-' || w.code || '-' || lpad(n::text, 2, '0')
+            WHEN 'B-H01-ED-06'  THEN 'out_of_service'
+            WHEN 'B-H02-GEN-04' THEN 'cleaning'
+            ELSE 'free'
+       END
+FROM (VALUES
+        ('H01', 'W-H01-ED',  'emergency', 'H01-ED',  6),
+        ('H01', 'W-H01-ICU', 'icu',       'H01-ICU', 3),
+        ('H01', 'W-H01-GEN', 'general',   'H01-GEN', 6),
+        ('H02', 'W-H02-ED',  'emergency', 'H02-ED',  4),
+        ('H02', 'W-H02-ICU', 'icu',       'H02-ICU', 2),
+        ('H02', 'W-H02-GEN', 'general',   'H02-GEN', 4)
+     ) AS w(hospital_id, ward_id, ward_type, code, bed_count)
+CROSS JOIN LATERAL generate_series(1, w.bed_count) AS n
+ON CONFLICT (bed_id) DO NOTHING;
+
+INSERT INTO equipment_types (type_id, name) VALUES
+    ('ventilator',      'Ventilator'),
+    ('defibrillator',   'Defibrillator'),
+    ('cardiac_monitor', 'Cardiac monitor'),
+    ('infusion_pump',   'Infusion pump')
+ON CONFLICT (type_id) DO NOTHING;
+
+INSERT INTO equipment_units (unit_id, type_id, hospital_id, ward_id, status, maintenance_due_date) VALUES
+    ('VENT-H01-01', 'ventilator',      'H01', 'W-H01-ICU', 'available',   NULL),
+    ('VENT-H01-02', 'ventilator',      'H01', 'W-H01-ICU', 'maintenance', DATE '2026-11-15'),
+    ('DEFIB-H01-01','defibrillator',   'H01', 'W-H01-ED',  'available',   NULL),
+    ('MON-H01-01',  'cardiac_monitor', 'H01', 'W-H01-ED',  'available',   NULL),
+    ('MON-H01-02',  'cardiac_monitor', 'H01', 'W-H01-ICU', 'available',   NULL),
+    ('VENT-H02-01', 'ventilator',      'H02', 'W-H02-ICU', 'available',   NULL),
+    ('DEFIB-H02-01','defibrillator',   'H02', 'W-H02-ED',  'available',   NULL),
+    ('MON-H02-01',  'cardiac_monitor', 'H02', 'W-H02-ED',  'available',   NULL)
+ON CONFLICT (unit_id) DO NOTHING;
+
+INSERT INTO patients (patient_id, display_name, age_years) VALUES
+    ('PT-001', 'Patient One (fictional)',   34),
+    ('PT-002', 'Patient Two (fictional)',   67),
+    ('PT-003', 'Patient Three (fictional)',  8)
+ON CONFLICT (patient_id) DO NOTHING;
+
+INSERT INTO incidents (incident_id, hospital_id, emergency_type, reported_severity, arrival_time, status, description) VALUES
+    ('INC-001', 'H01', 'road_traffic_collision', 'critical', TIMESTAMPTZ '2026-10-25 20:00:00+05:30', 'reported',
+        'Fictional drill: two patients arrive after a simulated vehicle collision.'),
+    ('INC-002', 'H01', 'chest_pain',             'high',     TIMESTAMPTZ '2026-10-25 20:05:00+05:30', 'reported',
+        'Fictional drill: one patient arrives with simulated chest pain.')
+ON CONFLICT (incident_id) DO NOTHING;
+
+INSERT INTO incident_patients (incident_id, patient_id, reported_condition) VALUES
+    ('INC-001', 'PT-001', 'Reported injuries after collision (simulated)'),
+    ('INC-001', 'PT-002', 'Reported injuries after collision (simulated)'),
+    ('INC-002', 'PT-003', 'Reported chest pain (simulated)')
+ON CONFLICT (incident_id, patient_id) DO NOTHING;
+
+-- Configurable constraints for the validator. These are DEMO placeholder values, not clinical guidance.
+INSERT INTO policy_settings (key, value, description) VALUES
+    ('max_active_patients_per_nurse',  '{"value": 4}',
+     'Demo workload limit: active patients one nurse may serve at once.'),
+    ('max_active_patients_per_doctor', '{"value": 6}',
+     'Demo workload limit: active patients one doctor may serve at once.'),
+    ('icu_requires_reported_severity', '{"values": ["critical"]}',
+     'DEMO PLACEHOLDER ONLY: reported severities allowed an ICU bed proposal. Real clinical policy must come from qualified clinicians.')
+ON CONFLICT (key) DO NOTHING;
+
+
+
+========================================
+FILE: backend\validator.py
+========================================
+"""Deterministic validator: plain Python rules, no AI involved.
+
+Two layers:
+  1. validate_against_record(proposal, nurse)  - PURE: no database, easy to unit test.
+  2. validate_proposal / validate_and_save_proposal - read the database, then call (1).
+"""
+
+from typing import Optional
+
+from backend import database, hospital_state
+from backend.schemas import ProposalInput, ValidationResult
+
+
+def validate_against_record(proposal: ProposalInput, nurse: Optional[dict]) -> ValidationResult:
+    """Decide whether a proposal is valid, given the nurse record (or None if no such nurse)."""
+    nurse_id = proposal.proposed_nurse_id
+
+    # Basic assignment rules (the only ones agreed so far; add more only after the team agrees).
+    if not nurse_id.strip():
+        return ValidationResult(valid=False, reason="Proposed nurse ID is empty.", nurse_id=nurse_id)
+    if not proposal.incident_description.strip():
+        return ValidationResult(valid=False, reason="Incident description is empty.", nurse_id=nurse_id)
+
+    # A nonexistent nurse and an unavailable nurse are different problems.
+    if nurse is None:
+        return ValidationResult(valid=False, reason=f"Nurse {nurse_id} does not exist.", nurse_id=nurse_id)
+
+    if not nurse["available"]:
+        return ValidationResult(
+            valid=False,
+            reason=f"Nurse {nurse_id} exists but is currently unavailable.",
+            nurse_id=nurse_id,
+            state_version=nurse["state_version"],
+        )
+
+    return ValidationResult(
+        valid=True,
+        reason=f"Nurse {nurse_id} exists and is available.",
+        nurse_id=nurse_id,
+        state_version=nurse["state_version"],
+    )
+
+
+def validate_proposal(conn, proposal: ProposalInput) -> ValidationResult:
+    """Read the nurse from the database (the authority) and validate. Saves nothing."""
+    nurse = hospital_state.get_nurse_state(conn, proposal.proposed_nurse_id)
+    return validate_against_record(proposal, nurse)
+
+
+def validate_and_save_proposal(conn, proposal: ProposalInput) -> ValidationResult:
+    """Validate, then store the proposal, its result and audit events in ONE transaction.
+
+    Invalid proposals are stored too (status 'rejected_by_validator') so the AI's
+    mistakes stay visible for auditing.
+    """
+    if database.get_proposal(conn, proposal.proposal_id) is not None:
+        raise ValueError(f"Proposal {proposal.proposal_id} already exists.")
+
+    result = validate_proposal(conn, proposal)
+    status = "pending_review" if result.valid else "rejected_by_validator"
+
+    with conn.transaction():
+        database.save_proposal(
+            conn,
+            proposal_id=proposal.proposal_id,
+            incident_description=proposal.incident_description,
+            proposed_nurse_id=proposal.proposed_nurse_id,
+            valid=result.valid,
+            reason=result.reason,
+            state_version_used=result.state_version if result.valid else None,
+            status=status,
+        )
+        database.add_audit_event(
+            conn, "proposal_created", proposal.proposal_id,
+            {"nurse_id": proposal.proposed_nurse_id},
+        )
+        database.add_audit_event(
+            conn,
+            "validation_passed" if result.valid else "validation_failed",
+            proposal.proposal_id,
+            {"reason": result.reason, "nurse_id": result.nurse_id,
+             "state_version": result.state_version},
+        )
+    return result
+
+
+
+========================================
+FILE: backend\__init__.py
+========================================
+
+
+========================================
+FILE: backend\migrations\001_nurse_only_baseline.sql
+========================================
+-- Migration 001: the original nurse-only schema, unchanged.
+-- Kept as the baseline so databases created by the earlier version of this project
+-- upgrade cleanly. Every statement uses IF NOT EXISTS, so applying it to a database
+-- that already has these tables does nothing.
+-- RULE: never edit a migration after it has been applied anywhere. Add a new one instead.
+
+CREATE TABLE IF NOT EXISTS nurses (
+    nurse_id      TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    available     BOOLEAN NOT NULL,
+    department    TEXT NOT NULL,
+    state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    proposal_id          TEXT PRIMARY KEY,
+    incident_description TEXT NOT NULL,
+    proposed_nurse_id    TEXT NOT NULL,
+    validation_valid     BOOLEAN NOT NULL,
+    validation_reason    TEXT NOT NULL,
+    state_version_used   INTEGER,
+    status               TEXT NOT NULL CHECK (status IN (
+                             'pending_review',
+                             'rejected_by_validator',
+                             'approved',
+                             'rejected_by_reviewer',
+                             'stale')),
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT valid_proposals_have_version
+        CHECK (NOT validation_valid OR state_version_used IS NOT NULL),
+    CONSTRAINT status_matches_validation
+        CHECK ((status = 'rejected_by_validator') = (NOT validation_valid))
+);
+
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE REFERENCES proposals (proposal_id),
+    reviewer    TEXT NOT NULL CHECK (length(trim(reviewer)) > 0),
+    decision    TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
+    reason      TEXT NOT NULL DEFAULT '',
+    decided_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    event_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    proposal_id TEXT REFERENCES proposals (proposal_id),
+    action      TEXT NOT NULL,
+    details     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_status      ON proposals (status);
+CREATE INDEX IF NOT EXISTS idx_proposals_nurse       ON proposals (proposed_nurse_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_proposal   ON audit_logs (proposal_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs (created_at);
+
+
+
+========================================
+FILE: backend\migrations\002_hospital_wide.sql
+========================================
+-- Migration 002: hospital-wide resource model (fictional data only).
+-- Evolves the nurse-only schema WITHOUT breaking it: old columns stay, old rows are kept,
+-- and the existing nurse-only workflow and its tests keep working.
+--
+-- Design rules used throughout:
+--   * Every resource row that can be reserved has a state_version (optimistic concurrency).
+--   * "Belongs to the correct hospital" is enforced by the database through composite
+--     foreign keys (resource_id, hospital_id), not only by Python.
+--   * AI-supplied IDs (proposal_items.resource_id) have NO foreign key, so invalid
+--     AI suggestions can still be stored and audited.
+--   * Exclusive resources (beds, equipment units) are protected by partial unique indexes:
+--     the database itself refuses two active allocations of the same bed.
+
+-- ============================================================ organisation
+
+CREATE TABLE hospitals (
+    hospital_id             TEXT PRIMARY KEY,
+    name                    TEXT NOT NULL,
+    city                    TEXT NOT NULL,
+    latitude                NUMERIC(8,5) CHECK (latitude  BETWEEN -90  AND 90),
+    longitude               NUMERIC(8,5) CHECK (longitude BETWEEN -180 AND 180),
+    operational_status      TEXT NOT NULL DEFAULT 'operational'
+                            CHECK (operational_status IN ('operational', 'diverting', 'closed')),
+    -- Configured operating cap on simultaneously active patients (a policy number,
+    -- separate from the physical bed count).
+    max_concurrent_patients INTEGER NOT NULL CHECK (max_concurrent_patients >= 0),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE wards (
+    ward_id       TEXT PRIMARY KEY,
+    hospital_id   TEXT NOT NULL REFERENCES hospitals (hospital_id),
+    name          TEXT NOT NULL,
+    ward_type     TEXT NOT NULL CHECK (ward_type IN ('emergency', 'icu', 'general')),
+    location_note TEXT NOT NULL DEFAULT '',
+    capacity      INTEGER NOT NULL CHECK (capacity > 0),
+    status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    -- Target for composite foreign keys ("this ward belongs to this hospital").
+    UNIQUE (ward_id, hospital_id)
+);
+
+-- ============================================================ staff
+
+-- Existing table: add the hospital and shift. Rows from the old demo (if any) are
+-- backfilled into hospital H01 so the new NOT NULL rule can be applied safely.
+ALTER TABLE nurses ADD COLUMN hospital_id TEXT;
+ALTER TABLE nurses ADD COLUMN shift TEXT NOT NULL DEFAULT 'day'
+    CHECK (shift IN ('day', 'evening', 'night'));
+
+INSERT INTO hospitals (hospital_id, name, city, max_concurrent_patients)
+SELECT 'H01', 'Riverside General (fictional)', 'Northport', 12
+WHERE EXISTS (SELECT 1 FROM nurses)
+ON CONFLICT (hospital_id) DO NOTHING;
+
+UPDATE nurses SET hospital_id = 'H01' WHERE hospital_id IS NULL;
+
+ALTER TABLE nurses ALTER COLUMN hospital_id SET NOT NULL;
+ALTER TABLE nurses ADD CONSTRAINT nurses_hospital_fk
+    FOREIGN KEY (hospital_id) REFERENCES hospitals (hospital_id);
+ALTER TABLE nurses ADD CONSTRAINT nurses_id_hospital_key UNIQUE (nurse_id, hospital_id);
+
+CREATE TABLE doctors (
+    doctor_id      TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    hospital_id    TEXT NOT NULL REFERENCES hospitals (hospital_id),
+    department     TEXT NOT NULL,
+    specialization TEXT NOT NULL,
+    shift          TEXT NOT NULL CHECK (shift IN ('day', 'evening', 'night')),
+    available      BOOLEAN NOT NULL,
+    state_version  INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
+    UNIQUE (doctor_id, hospital_id)
+);
+
+-- ============================================================ beds and equipment
+
+-- Cleaning is part of status ('cleaning') so there is no second column that could
+-- contradict it. A bed can only be reserved when its status is 'free'.
+CREATE TABLE beds (
+    bed_id        TEXT PRIMARY KEY,
+    hospital_id   TEXT NOT NULL,
+    ward_id       TEXT NOT NULL,
+    bed_type      TEXT NOT NULL CHECK (bed_type IN ('emergency', 'icu', 'general')),
+    status        TEXT NOT NULL DEFAULT 'free'
+                  CHECK (status IN ('free', 'reserved', 'occupied', 'cleaning', 'out_of_service')),
+    state_version INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
+    FOREIGN KEY (ward_id, hospital_id) REFERENCES wards (ward_id, hospital_id),
+    UNIQUE (bed_id, hospital_id)
+);
+
+CREATE TABLE equipment_types (
+    type_id TEXT PRIMARY KEY,
+    name    TEXT NOT NULL
+);
+
+-- Each physical unit is tracked individually (its own status, maintenance date, version).
+CREATE TABLE equipment_units (
+    unit_id              TEXT PRIMARY KEY,
+    type_id              TEXT NOT NULL REFERENCES equipment_types (type_id),
+    hospital_id          TEXT NOT NULL REFERENCES hospitals (hospital_id),
+    ward_id              TEXT,   -- NULL = stored centrally, not in a ward
+    status               TEXT NOT NULL DEFAULT 'available'
+                         CHECK (status IN ('available', 'reserved', 'in_use', 'maintenance', 'out_of_service')),
+    maintenance_due_date DATE,
+    state_version        INTEGER NOT NULL DEFAULT 1 CHECK (state_version >= 1),
+    FOREIGN KEY (ward_id, hospital_id) REFERENCES wards (ward_id, hospital_id),
+    UNIQUE (unit_id, hospital_id)
+);
+
+-- Trigger: a ward cannot hold more beds than its capacity, and a bed's type must
+-- match its ward's type. Locking the ward row serialises two simultaneous bed inserts.
+CREATE FUNCTION enforce_ward_rules() RETURNS trigger AS $$
+DECLARE
+    ward_capacity INTEGER;
+    ward_kind     TEXT;
+    bed_count     INTEGER;
+BEGIN
+    SELECT capacity, ward_type INTO ward_capacity, ward_kind
+      FROM wards WHERE ward_id = NEW.ward_id FOR UPDATE;
+
+    IF ward_kind <> NEW.bed_type THEN
+        RAISE EXCEPTION 'Bed type % does not match ward type % for ward %',
+            NEW.bed_type, ward_kind, NEW.ward_id;
+    END IF;
+
+    SELECT count(*) INTO bed_count FROM beds
+     WHERE ward_id = NEW.ward_id AND bed_id <> NEW.bed_id;
+    IF bed_count >= ward_capacity THEN
+        RAISE EXCEPTION 'Ward % is at capacity (%)', NEW.ward_id, ward_capacity;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER beds_enforce_ward_rules
+    BEFORE INSERT OR UPDATE OF ward_id, bed_type ON beds
+    FOR EACH ROW EXECUTE FUNCTION enforce_ward_rules();
+
+-- ============================================================ patients and incidents
+
+-- is_fictional can only be TRUE: the database refuses non-fictional patient rows.
+CREATE TABLE patients (
+    patient_id   TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    age_years    INTEGER CHECK (age_years BETWEEN 0 AND 120),
+    is_fictional BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT patients_must_be_fictional CHECK (is_fictional)
+);
+
+CREATE TABLE incidents (
+    incident_id       TEXT PRIMARY KEY,
+    hospital_id       TEXT NOT NULL REFERENCES hospitals (hospital_id),
+    emergency_type    TEXT NOT NULL,
+    reported_severity TEXT NOT NULL CHECK (reported_severity IN ('low', 'moderate', 'high', 'critical')),
+    arrival_time      TIMESTAMPTZ NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'reported'
+                      CHECK (status IN ('reported', 'extracted', 'planned', 'pending_review',
+                                        'allocated', 'closed', 'cancelled')),
+    description       TEXT NOT NULL,
+    extraction        JSONB,   -- Agent A output (kept as evidence; untrusted until validated)
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (incident_id, hospital_id)
+);
+
+-- Which patients belong to which incident (many-to-many).
+CREATE TABLE incident_patients (
+    incident_id        TEXT NOT NULL REFERENCES incidents (incident_id),
+    patient_id         TEXT NOT NULL REFERENCES patients (patient_id),
+    reported_condition TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (incident_id, patient_id)
+);
+
+-- ============================================================ users and policy
+
+-- Password hashes are added in the authentication phase; no users are seeded yet.
+CREATE TABLE app_users (
+    user_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username      TEXT NOT NULL UNIQUE CHECK (length(trim(username)) > 0),
+    role          TEXT NOT NULL CHECK (role IN ('administrator', 'reviewer')),
+    password_hash TEXT NOT NULL,
+    active        BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Explicit, configurable constraints read by the validator (workload limits etc.).
+CREATE TABLE policy_settings (
+    key         TEXT PRIMARY KEY,
+    value       JSONB NOT NULL,
+    description TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ============================================================ proposals (extended)
+
+ALTER TABLE proposals ADD COLUMN proposal_kind TEXT NOT NULL DEFAULT 'nurse_only'
+    CHECK (proposal_kind IN ('nurse_only', 'bundle'));
+ALTER TABLE proposals ADD COLUMN incident_id         TEXT REFERENCES incidents (incident_id);
+ALTER TABLE proposals ADD COLUMN patient_id          TEXT REFERENCES patients (patient_id);
+ALTER TABLE proposals ADD COLUMN parent_proposal_id  TEXT REFERENCES proposals (proposal_id);
+ALTER TABLE proposals ADD COLUMN plan_label          TEXT NOT NULL DEFAULT 'preferred';
+ALTER TABLE proposals ADD COLUMN explanation         TEXT NOT NULL DEFAULT '';
+ALTER TABLE proposals ADD COLUMN input_snapshot      JSONB;
+ALTER TABLE proposals ADD COLUMN unmet_requirements  JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE proposals ADD COLUMN validation_errors   JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE proposals ADD COLUMN validation_warnings JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- Bundle proposals name several resources (see proposal_items), not one nurse.
+ALTER TABLE proposals ALTER COLUMN proposed_nurse_id DROP NOT NULL;
+ALTER TABLE proposals ADD CONSTRAINT nurse_only_needs_nurse
+    CHECK (proposal_kind <> 'nurse_only' OR proposed_nurse_id IS NOT NULL);
+ALTER TABLE proposals ADD CONSTRAINT bundle_needs_incident_and_patient
+    CHECK (proposal_kind <> 'bundle' OR (incident_id IS NOT NULL AND patient_id IS NOT NULL));
+
+-- Bundle versions live per item, so the single-version rule applies to nurse-only proposals.
+ALTER TABLE proposals DROP CONSTRAINT valid_proposals_have_version;
+ALTER TABLE proposals ADD CONSTRAINT valid_proposals_have_version
+    CHECK (NOT validation_valid OR proposal_kind = 'bundle' OR state_version_used IS NOT NULL);
+
+-- New status: 'superseded' = the reviewer asked for a revision and a new proposal replaced it.
+ALTER TABLE proposals DROP CONSTRAINT proposals_status_check;
+ALTER TABLE proposals ADD CONSTRAINT proposals_status_check
+    CHECK (status IN ('pending_review', 'rejected_by_validator', 'approved',
+                      'rejected_by_reviewer', 'stale', 'superseded'));
+
+-- One row per resource the AI proposed. resource_id deliberately has NO foreign key.
+CREATE TABLE proposal_items (
+    item_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    proposal_id   TEXT NOT NULL REFERENCES proposals (proposal_id),
+    resource_type TEXT NOT NULL CHECK (resource_type IN ('bed', 'doctor', 'nurse', 'equipment')),
+    resource_id   TEXT NOT NULL,
+    version_used  INTEGER,   -- version the BACKEND read; NULL if the resource does not exist
+    UNIQUE (proposal_id, resource_type, resource_id)
+);
+
+-- ============================================================ approvals (extended)
+
+ALTER TABLE approvals ADD COLUMN reviewer_user_id BIGINT REFERENCES app_users (user_id);
+ALTER TABLE approvals DROP CONSTRAINT approvals_decision_check;
+ALTER TABLE approvals ADD CONSTRAINT approvals_decision_check
+    CHECK (decision IN ('approved', 'rejected', 'revision_requested'));
+
+-- ============================================================ allocations
+
+-- One allocation = the complete resource bundle committed for ONE patient of ONE incident.
+CREATE TABLE allocations (
+    allocation_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    hospital_id   TEXT NOT NULL,
+    incident_id   TEXT NOT NULL,
+    patient_id    TEXT NOT NULL,
+    proposal_id   TEXT NOT NULL UNIQUE REFERENCES proposals (proposal_id),
+    status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released', 'cancelled')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at      TIMESTAMPTZ,
+    end_reason    TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (incident_id, hospital_id) REFERENCES incidents (incident_id, hospital_id),
+    -- The patient must actually be linked to that incident.
+    FOREIGN KEY (incident_id, patient_id) REFERENCES incident_patients (incident_id, patient_id),
+    UNIQUE (allocation_id, hospital_id),
+    CONSTRAINT active_means_not_ended CHECK ((status = 'active') = (ended_at IS NULL))
+);
+
+CREATE UNIQUE INDEX one_active_allocation_per_patient
+    ON allocations (patient_id) WHERE status = 'active';
+
+CREATE TABLE allocation_items (
+    item_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    allocation_id     BIGINT NOT NULL,
+    hospital_id       TEXT NOT NULL,
+    resource_type     TEXT NOT NULL CHECK (resource_type IN ('bed', 'doctor', 'nurse', 'equipment')),
+    bed_id            TEXT,
+    doctor_id         TEXT,
+    nurse_id          TEXT,
+    equipment_unit_id TEXT,
+    status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released')),
+    FOREIGN KEY (allocation_id, hospital_id)     REFERENCES allocations (allocation_id, hospital_id),
+    FOREIGN KEY (bed_id, hospital_id)            REFERENCES beds (bed_id, hospital_id),
+    FOREIGN KEY (doctor_id, hospital_id)         REFERENCES doctors (doctor_id, hospital_id),
+    FOREIGN KEY (nurse_id, hospital_id)          REFERENCES nurses (nurse_id, hospital_id),
+    FOREIGN KEY (equipment_unit_id, hospital_id) REFERENCES equipment_units (unit_id, hospital_id),
+    -- Exactly one resource column is filled, and it matches resource_type.
+    CONSTRAINT exactly_one_resource CHECK (
+        (resource_type = 'bed'       AND bed_id IS NOT NULL AND doctor_id IS NULL AND nurse_id IS NULL AND equipment_unit_id IS NULL) OR
+        (resource_type = 'doctor'    AND doctor_id IS NOT NULL AND bed_id IS NULL AND nurse_id IS NULL AND equipment_unit_id IS NULL) OR
+        (resource_type = 'nurse'     AND nurse_id IS NOT NULL AND bed_id IS NULL AND doctor_id IS NULL AND equipment_unit_id IS NULL) OR
+        (resource_type = 'equipment' AND equipment_unit_id IS NOT NULL AND bed_id IS NULL AND doctor_id IS NULL AND nurse_id IS NULL)
+    )
+);
+
+-- Database backstops for exclusive resources (doctors and nurses may serve several
+-- patients, limited by workload policy instead).
+CREATE UNIQUE INDEX one_active_item_per_bed
+    ON allocation_items (bed_id) WHERE status = 'active' AND bed_id IS NOT NULL;
+CREATE UNIQUE INDEX one_active_item_per_equipment_unit
+    ON allocation_items (equipment_unit_id) WHERE status = 'active' AND equipment_unit_id IS NOT NULL;
+CREATE UNIQUE INDEX one_active_bed_per_allocation
+    ON allocation_items (allocation_id) WHERE status = 'active' AND resource_type = 'bed';
+
+-- ============================================================ audit log (extended)
+
+ALTER TABLE audit_logs ADD COLUMN actor       TEXT NOT NULL DEFAULT 'system';
+ALTER TABLE audit_logs ADD COLUMN entity_type TEXT;
+ALTER TABLE audit_logs ADD COLUMN entity_id   TEXT;
+
+-- Audit integrity: rows can be added but never changed or deleted.
+CREATE FUNCTION audit_logs_are_append_only() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_logs is append-only (% is not allowed)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER audit_logs_no_update_or_delete
+    BEFORE UPDATE OR DELETE ON audit_logs
+    FOR EACH ROW EXECUTE FUNCTION audit_logs_are_append_only();
+
+-- ============================================================ indexes
+
+CREATE INDEX idx_wards_hospital              ON wards (hospital_id);
+CREATE INDEX idx_beds_lookup                 ON beds (hospital_id, ward_id, status);
+CREATE INDEX idx_doctors_lookup              ON doctors (hospital_id, available);
+CREATE INDEX idx_nurses_hospital             ON nurses (hospital_id, available);
+CREATE INDEX idx_equipment_lookup            ON equipment_units (hospital_id, type_id, status);
+CREATE INDEX idx_incidents_hospital_status   ON incidents (hospital_id, status);
+CREATE INDEX idx_incident_patients_patient   ON incident_patients (patient_id);
+CREATE INDEX idx_proposals_incident          ON proposals (incident_id);
+CREATE INDEX idx_proposal_items_proposal     ON proposal_items (proposal_id);
+CREATE INDEX idx_allocations_status          ON allocations (status);
+CREATE INDEX idx_allocations_incident        ON allocations (incident_id);
+CREATE INDEX idx_allocation_items_allocation ON allocation_items (allocation_id);
+CREATE INDEX idx_audit_logs_entity           ON audit_logs (entity_type, entity_id);
+
+
+
+========================================
+FILE: docs\erd.md
+========================================
+# Entity relationship design (Phase 2)
+
+Fictional data only. Not clinically validated.
+
+## Diagram
+
+```mermaid
+erDiagram
+    hospitals ||--o{ wards : "has"
+    hospitals ||--o{ nurses : "employs"
+    hospitals ||--o{ doctors : "employs"
+    hospitals ||--o{ beds : "owns"
+    hospitals ||--o{ equipment_units : "owns"
+    hospitals ||--o{ incidents : "receives"
+    wards ||--o{ beds : "contains"
+    wards |o--o{ equipment_units : "stores"
+    equipment_types ||--o{ equipment_units : "classifies"
+    incidents ||--o{ incident_patients : "involves"
+    patients ||--o{ incident_patients : "appears in"
+    incidents ||--o{ proposals : "gets plans"
+    patients ||--o{ proposals : "gets plans"
+    proposals ||--o{ proposals : "revised by"
+    proposals ||--o{ proposal_items : "lists"
+    proposals ||--o| approvals : "decided by"
+    app_users |o--o{ approvals : "reviewer"
+    proposals ||--o| allocations : "committed as"
+    incident_patients ||--o{ allocations : "receives"
+    allocations ||--o{ allocation_items : "bundles"
+    beds |o--o{ allocation_items : "reserved in"
+    doctors |o--o{ allocation_items : "assigned in"
+    nurses |o--o{ allocation_items : "assigned in"
+    equipment_units |o--o{ allocation_items : "reserved in"
+    proposals |o--o{ audit_logs : "history"
+```
+
+`policy_settings` (configurable validator limits) and `schema_migrations` (migration
+bookkeeping) stand alone.
+
+## How the tables relate
+
+| Table | Purpose | Key relationships |
+|---|---|---|
+| `hospitals` | Identity, location, status, `max_concurrent_patients` cap | Parent of almost everything |
+| `wards` | Ward type, capacity, open/closed | Belongs to a hospital |
+| `nurses`, `doctors` | Staff, shift, availability, `state_version` | Belong to a hospital |
+| `beds` | Bed type and status (`free`, `reserved`, `occupied`, `cleaning`, `out_of_service`) plus version | Belong to a ward **and** the same hospital |
+| `equipment_types`, `equipment_units` | Each physical unit tracked individually (status, maintenance date, version) | Unit belongs to a hospital; optional ward in that hospital |
+| `patients` | Fictional patients (the database refuses `is_fictional = FALSE`) | Linked to incidents |
+| `incidents`, `incident_patients` | Emergency, reported severity, arrival time, status, Agent A extraction (JSONB) | Incident belongs to the receiving hospital; many patients per incident |
+| `proposals` | AI plans: input snapshot, validation errors/warnings, unmet requirements, explanation, alternatives (`parent_proposal_id`, `plan_label`) | Bundle proposals point to an incident and patient |
+| `proposal_items` | One row per resource the AI proposed | `resource_id` has **no** foreign key, so invalid AI suggestions stay auditable |
+| `approvals` | Reviewer decision: approved, rejected, or revision requested | One decision per proposal; optional link to `app_users` |
+| `allocations` | The complete committed bundle for one patient of one incident | Created from exactly one proposal |
+| `allocation_items` | The bed, doctor(s), nurse(s), equipment unit(s) in the bundle | Each item references exactly one resource in the same hospital |
+| `audit_logs` | Append-only history with actor and entity | Optional link to a proposal |
+| `app_users` | Administrators and reviewers (hash column filled in the auth phase) | Referenced by approvals |
+| `policy_settings` | Workload limits and demo policy placeholders read by the validator | None |
+
+## Rules the database enforces by itself
+
+| Rule | Mechanism |
+|---|---|
+| A resource belongs to the same hospital as its ward / allocation | Composite foreign keys `(id, hospital_id)` |
+| A patient can only be allocated under an incident they belong to | Composite FK to `incident_patients` |
+| A bed or equipment unit has at most one **active** allocation | Partial unique indexes (`WHERE status = 'active'`) |
+| A patient has at most one active allocation; an allocation has at most one active bed | Partial unique indexes |
+| An allocation item fills exactly the column matching its `resource_type` | CHECK `exactly_one_resource` |
+| Active allocations have no end time; ended ones do | CHECK `active_means_not_ended` |
+| A ward holds no more beds than its capacity; bed type matches ward type | Trigger `enforce_ward_rules` |
+| Only fictional patients can be stored | CHECK `patients_must_be_fictional` |
+| An invalid proposal can only ever have status `rejected_by_validator` | CHECK `status_matches_validation` (from migration 001) |
+| Each proposal is decided at most once | `UNIQUE (proposal_id)` on approvals |
+| Audit rows cannot be edited or deleted | Trigger `audit_logs_are_append_only` |
+
+## Design decisions to know about
+
+- **Per-row versions.** Beds, doctors, nurses and equipment units each carry a `state_version`, increased on every change. A proposal item remembers the version the *backend* read.
+- **Cleaning is part of bed `status`.** A separate cleaning column could contradict the status, so `'cleaning'` is one of its values.
+- **Doctors and nurses may serve several patients.** Their limit comes from `policy_settings`, not a unique index. Beds and equipment units are exclusive.
+- **Workload is derived, not stored.** Active patients per staff member are counted from active `allocation_items`, avoiding a duplicate counter that could drift.
+- **Not yet enforced by the database (Phase 5-6, Python):** hospital capacity vs `max_concurrent_patients`, workload limits, ICU eligibility policy, shift matching, and "required components present". Reasons: they depend on configurable policy or on counting across rows.
+- **`TRUNCATE` bypasses the audit-log trigger.** Real protection will also need a restricted database role for the API (later phase); test and demo-reset tooling deliberately truncate.
+
+
+
+========================================
+FILE: scripts\db_tools.py
+========================================
+"""Small helpers shared by the init script, the reset script and the tests."""
+
+from pathlib import Path
+
+from psycopg import sql
+
+SEED_FILE = Path(__file__).resolve().parent.parent / "backend" / "seed.sql"
+
+
+def apply_seed(conn) -> None:
+    """Insert the fictional demo data. Safe to repeat: existing rows are never overwritten."""
+    conn.execute(SEED_FILE.read_text(encoding="utf-8"))
+
+
+def application_tables(conn) -> list[str]:
+    """Names of all application tables (everything except the migration bookkeeping table)."""
+    rows = conn.execute(
+        """
+        SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+           AND table_name <> 'schema_migrations'
+         ORDER BY table_name
+        """
+    ).fetchall()
+    return [r["table_name"] for r in rows]
+
+
+def row_counts(conn) -> dict[str, int]:
+    counts = {}
+    for name in application_tables(conn):
+        query = sql.SQL("SELECT count(*) AS n FROM {}").format(sql.Identifier(name))
+        counts[name] = conn.execute(query).fetchone()["n"]
+    return counts
+
+
+def truncate_all_tables(conn) -> None:
+    """DESTRUCTIVE: empties every application table. Only for tests and the reset script.
+    Table names come from the database itself and are quoted with sql.Identifier."""
+    names = application_tables(conn)
+    if names:
+        query = sql.SQL("TRUNCATE {} RESTART IDENTITY CASCADE").format(
+            sql.SQL(", ").join(sql.Identifier(n) for n in names)
+        )
+        conn.execute(query)
+
+
+
+========================================
+FILE: scripts\init_db.py
+========================================
+"""Create/upgrade the tables and insert the fictional demo data.
+
+Run from the project folder:  python -m scripts.init_db
+
+Safe to run again: pending migrations are applied once, and the seed never deletes
+or overwrites existing rows. Before upgrading a database that holds data you care
+about, take a backup (see README).
+"""
+
+from backend.database import get_connection
+from scripts.db_tools import apply_seed, row_counts
+from scripts.migrate import apply_migrations
+
+
+def main() -> None:
+    with get_connection() as conn:
+        applied = apply_migrations(conn)
+        print("Applied migrations:", ", ".join(applied) if applied else "none (already up to date)")
+        apply_seed(conn)
+        print("Seed data applied (existing rows left untouched).")
+        print("\nRow counts:")
+        for table, count in row_counts(conn).items():
+            print(f"  {table:<20} {count}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+========================================
+FILE: scripts\migrate.py
+========================================
+"""Apply pending database migrations.
+
+A migration is a numbered .sql file in backend/migrations/. This script:
+  1. creates a bookkeeping table, schema_migrations, if needed;
+  2. applies every file that has not been applied yet, in filename order,
+     each inside its own transaction (all-or-nothing);
+  3. records each applied file with a checksum.
+
+If a file that was already applied has since been edited, it stops with an error:
+applied migrations must never change. Add a new numbered file instead.
+
+Run from the project folder:  python -m scripts.migrate
+"""
+
+import hashlib
+from pathlib import Path
+
+from backend.database import get_connection
+
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "backend" / "migrations"
+LOCK_ID = 7234001   # any fixed number; stops two migrators running at the same time
+
+
+def migration_files() -> list[Path]:
+    return sorted(MIGRATIONS_DIR.glob("*.sql"))
+
+
+def checksum_of(path: Path) -> str:
+    # read_text normalises Windows (CRLF) line endings, so the checksum is the same on every machine.
+    return hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+
+
+def apply_migrations(conn) -> list[str]:
+    """Apply all pending migrations. Returns the names of the ones applied now."""
+    conn.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    TEXT PRIMARY KEY,
+                checksum   TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        done = {r["version"]: r["checksum"]
+                for r in conn.execute("SELECT version, checksum FROM schema_migrations").fetchall()}
+
+        applied_now = []
+        for path in migration_files():
+            digest = checksum_of(path)
+            if path.name in done:
+                if done[path.name] != digest:
+                    raise RuntimeError(
+                        f"Migration {path.name} was edited after it was applied. "
+                        "Restore the original file and add a new migration instead."
+                    )
+                continue
+            with conn.transaction():
+                conn.execute(path.read_text(encoding="utf-8"))
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, checksum) VALUES (%s, %s)",
+                    (path.name, digest),
+                )
+            applied_now.append(path.name)
+        return applied_now
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(%s)", (LOCK_ID,))
+
+
+def main() -> None:
+    with get_connection() as conn:
+        applied = apply_migrations(conn)
+        if applied:
+            for name in applied:
+                print(f"Applied {name}")
+        else:
+            print("Database is up to date. Nothing to apply.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+========================================
+FILE: scripts\reset_demo.py
+========================================
+"""Reset the DEMO database: delete ALL application data and re-insert the fictional seed data.
+
+This is destructive. It shows what will be deleted and asks you to type RESET.
+It keeps the table structure (and the migration history) intact.
+Run from the project folder:  python -m scripts.reset_demo
+
+Optional backup first (PowerShell):
+    docker compose exec db pg_dump -U crisisguard crisisguard > backup_demo.sql
+"""
+
+from backend.database import get_connection
+from scripts.db_tools import apply_seed, row_counts, truncate_all_tables
+
+
+def main() -> None:
+    with get_connection() as conn:
+        counts = row_counts(conn)
+        for table, count in counts.items():
+            if count:
+                print(f"{table}: {count} rows will be deleted")
+        print("The seed data will then be inserted again.")
+
+        if input("Type RESET to continue: ").strip() != "RESET":
+            print("Cancelled. Nothing was changed.")
+            return
+
+        with conn.transaction():
+            truncate_all_tables(conn)
+            apply_seed(conn)
+        print("Demo data reset.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+========================================
+FILE: scripts\__init__.py
+========================================
+
+
+========================================
+FILE: tests\conftest.py
+========================================
+"""Shared test fixtures.
+
+Safety rules for integration tests:
+  - They use TEST_DATABASE_URL, never DATABASE_URL.
+  - The test database name must end in "_test", otherwise the tests refuse to run,
+    because each test wipes and re-seeds the tables.
+  - If PostgreSQL is not reachable, integration tests are skipped (unit tests still run).
+"""
+
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+
+import psycopg
+import pytest
+from dotenv import load_dotenv
+
+from backend import database
+from backend.schemas import ProposalInput
+from scripts.db_tools import apply_seed, truncate_all_tables
+from scripts.migrate import apply_migrations
+
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
+
+
+def make_proposal(proposal_id: str, nurse_id: str,
+                  incident: str = "Fictional incident: simulated emergency.") -> ProposalInput:
+    return ProposalInput(proposal_id=proposal_id, incident_description=incident,
+                         proposed_nurse_id=nurse_id)
+
+
+@pytest.fixture(scope="session")
+def test_db_url():
+    url = os.environ.get("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL is not set; skipping PostgreSQL integration tests.")
+    if not urlparse(url).path.lstrip("/").endswith("_test"):
+        pytest.fail("TEST_DATABASE_URL must point to a database whose name ends in '_test'.")
+    if url == os.environ.get("DATABASE_URL"):
+        pytest.fail("TEST_DATABASE_URL must not equal DATABASE_URL.")
+    try:
+        psycopg.connect(url, connect_timeout=3).close()
+    except psycopg.OperationalError as exc:
+        pytest.skip(f"Cannot connect to the test database: {exc}")
+    return url
+
+
+@pytest.fixture(scope="session")
+def _schema(test_db_url):
+    """Bring the test database's structure up to date using the real migrations."""
+    with database.get_connection(test_db_url) as c:
+        apply_migrations(c)
+
+
+@pytest.fixture
+def conn(test_db_url, _schema):
+    """A connection to the TEST database, with tables emptied and re-seeded for each test."""
+    with database.get_connection(test_db_url) as c:
+        truncate_all_tables(c)
+        apply_seed(c)
+        yield c
+
+
+
+========================================
+FILE: tests\test_approval.py
+========================================
+"""PostgreSQL integration tests for the approval workflow.
+
+Every test uses the isolated TEST database (see conftest.py).
+"""
+
+import threading
+
+import pytest
+
+from backend import approval, database
+from backend.validator import validate_and_save_proposal
+from tests.conftest import make_proposal
+
+pytestmark = pytest.mark.integration
+
+
+def test_valid_approval_updates_availability_and_version(conn):
+    validate_and_save_proposal(conn, make_proposal("P1", "N01"))
+    result = approval.approve_proposal(conn, "P1", "Reviewer 1", "looks fine")
+
+    assert result.outcome == "committed"
+    assert result.new_state_version == 2
+    nurse = database.get_nurse(conn, "N01")
+    assert nurse["available"] is False
+    assert nurse["state_version"] == 2
+    assert database.get_proposal(conn, "P1")["status"] == "approved"
+    assert len(database.list_approvals(conn, "P1")) == 1
+
+
+def test_invalid_proposal_cannot_be_approved(conn):
+    validate_and_save_proposal(conn, make_proposal("P2", "N02"))   # unavailable nurse
+    result = approval.approve_proposal(conn, "P2", "Reviewer 1")
+
+    assert result.outcome == "rejected"
+    assert database.get_proposal(conn, "P2")["status"] == "rejected_by_validator"
+    assert database.get_nurse(conn, "N02")["state_version"] == 1    # untouched
+    assert database.list_approvals(conn, "P2") == []
+
+
+def test_nonexistent_nurse_proposal_is_stored_and_cannot_be_approved(conn):
+    result = validate_and_save_proposal(conn, make_proposal("P3", "N99"))
+    assert result.valid is False
+    saved = database.get_proposal(conn, "P3")
+    assert saved["proposed_nurse_id"] == "N99"
+    assert "does not exist" in saved["validation_reason"]
+    assert approval.approve_proposal(conn, "P3", "Reviewer 1").outcome == "rejected"
+
+
+def test_reviewer_rejection_leaves_nurse_unchanged(conn):
+    validate_and_save_proposal(conn, make_proposal("P4", "N03"))
+    result = approval.reject_proposal(conn, "P4", "Reviewer 1", "not needed")
+
+    assert result.outcome == "rejected"
+    assert database.get_proposal(conn, "P4")["status"] == "rejected_by_reviewer"
+    nurse = database.get_nurse(conn, "N03")
+    assert nurse["available"] is True and nurse["state_version"] == 1
+    assert database.list_approvals(conn, "P4")[0]["decision"] == "rejected"
+
+
+def test_repeated_approval_does_not_change_state_twice(conn):
+    validate_and_save_proposal(conn, make_proposal("P5", "N01"))
+    first = approval.approve_proposal(conn, "P5", "Reviewer 1")
+    second = approval.approve_proposal(conn, "P5", "Reviewer 1")
+
+    assert first.outcome == "committed"
+    assert second.outcome == "rejected"
+    assert database.get_nurse(conn, "N01")["state_version"] == 2   # bumped once only
+    assert len(database.list_approvals(conn, "P5")) == 1
+
+
+def test_proposal_that_becomes_stale_is_not_committed(conn):
+    validate_and_save_proposal(conn, make_proposal("P6", "N01"))
+    # Meanwhile the real state changes (simulated by a direct update, as another workflow would).
+    conn.execute("UPDATE nurses SET state_version = state_version + 1 WHERE nurse_id = 'N01'")
+
+    result = approval.approve_proposal(conn, "P6", "Reviewer 1")
+    assert result.outcome == "stale"
+    assert database.get_proposal(conn, "P6")["status"] == "stale"
+    assert database.get_nurse(conn, "N01")["available"] is True    # not assigned
+
+
+def test_two_proposals_for_same_nurse_only_one_commits(conn):
+    validate_and_save_proposal(conn, make_proposal("PA", "N01"))
+    validate_and_save_proposal(conn, make_proposal("PB", "N01"))   # both valid at version 1
+
+    first = approval.approve_proposal(conn, "PA", "Reviewer 1")
+    second = approval.approve_proposal(conn, "PB", "Reviewer 2")
+
+    assert first.outcome == "committed"
+    assert second.outcome == "stale"
+    assert database.get_nurse(conn, "N01")["state_version"] == 2
+
+
+def _run_together(test_db_url, calls):
+    """Run each (proposal_id, reviewer) approval in its own thread and connection,
+    starting at the same moment. Returns the list of outcomes."""
+    outcomes = []
+    barrier = threading.Barrier(len(calls))
+
+    def worker(proposal_id, reviewer):
+        with database.get_connection(test_db_url) as c:
+            barrier.wait()
+            outcomes.append(approval.approve_proposal(c, proposal_id, reviewer).outcome)
+
+    threads = [threading.Thread(target=worker, args=call) for call in calls]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return outcomes
+
+
+def test_simultaneous_approvals_for_same_nurse_only_one_commits(conn, test_db_url):
+    validate_and_save_proposal(conn, make_proposal("PA", "N01"))
+    validate_and_save_proposal(conn, make_proposal("PB", "N01"))
+
+    outcomes = _run_together(test_db_url, [("PA", "Reviewer 1"), ("PB", "Reviewer 2")])
+
+    assert sorted(outcomes) == ["committed", "stale"]
+    assert database.get_nurse(conn, "N01")["state_version"] == 2
+    assert len(database.list_approvals(conn)) == 1
+
+
+def test_simultaneous_double_click_on_same_proposal_commits_once(conn, test_db_url):
+    validate_and_save_proposal(conn, make_proposal("PA", "N01"))
+
+    outcomes = _run_together(test_db_url, [("PA", "Reviewer 1"), ("PA", "Reviewer 1")])
+
+    assert sorted(outcomes) == ["committed", "rejected"]
+    assert database.get_nurse(conn, "N01")["state_version"] == 2
+    assert len(database.list_approvals(conn, "PA")) == 1
+
+
+def test_database_failure_rolls_back_everything(conn, monkeypatch):
+    validate_and_save_proposal(conn, make_proposal("P7", "N01"))
+    real_add_audit_event = database.add_audit_event
+
+    def failing_add_audit_event(c, action, proposal_id, details):
+        if action == "assignment_committed":      # fail at the very last step
+            raise RuntimeError("simulated database failure")
+        real_add_audit_event(c, action, proposal_id, details)
+
+    monkeypatch.setattr(database, "add_audit_event", failing_add_audit_event)
+
+    with pytest.raises(RuntimeError):
+        approval.approve_proposal(conn, "P7", "Reviewer 1")
+
+    monkeypatch.undo()
+    nurse = database.get_nurse(conn, "N01")
+    assert nurse["available"] is True and nurse["state_version"] == 1   # nurse update undone
+    assert database.get_proposal(conn, "P7")["status"] == "pending_review"
+    assert database.list_approvals(conn, "P7") == []                    # approval row undone
+    actions = [e["action"] for e in database.list_audit_events(conn, "P7")]
+    assert "assignment_committed" not in actions and "reviewer_approved" not in actions
+
+
+
+========================================
+FILE: tests\test_scenarios.py
+========================================
+"""Scenario tests: the seeded evaluation (unit) and audit-trail checks (integration)."""
+
+from pathlib import Path
+
+import pytest
+
+from backend import approval, database, evaluation
+from backend.validator import validate_and_save_proposal
+from tests.conftest import make_proposal
+
+
+# ------------------------------------------------------------------ unit (no database)
+
+def test_all_seeded_evaluation_scenarios_pass():
+    results = evaluation.run_scenarios()
+    failures = [r for r in results if not r["passed"]]
+    assert failures == []
+
+
+# ----------------------------------------------------------- integration (PostgreSQL)
+
+@pytest.mark.integration
+def test_seed_sql_matches_evaluation_fixture(conn):
+    # The seed now also contains nurses for a second hospital; compare the original three.
+    nurses = {n["nurse_id"]: n for n in database.list_nurses(conn)
+              if n["nurse_id"] in evaluation.SEED_NURSES}
+    assert nurses == evaluation.SEED_NURSES
+
+
+@pytest.mark.integration
+def test_read_functions(conn):
+    available = [n["nurse_id"] for n in database.list_available_nurses(conn)]
+    assert "N01" in available and "N03" in available and "N02" not in available
+    assert database.get_nurse(conn, "N99") is None
+    assert database.get_state_version(conn, "N01") == 1
+
+
+@pytest.mark.integration
+def test_audit_trail_for_successful_workflow(conn):
+    validate_and_save_proposal(conn, make_proposal("P1", "N01"))
+    approval.approve_proposal(conn, "P1", "Reviewer 1", "ok")
+    actions = [e["action"] for e in database.list_audit_events(conn, "P1")]
+    assert actions == ["proposal_created", "validation_passed",
+                       "reviewer_approved", "assignment_committed"]
+
+
+@pytest.mark.integration
+def test_audit_trail_for_validation_failure(conn):
+    validate_and_save_proposal(conn, make_proposal("P2", "N99"))
+    events = database.list_audit_events(conn, "P2")
+    assert [e["action"] for e in events] == ["proposal_created", "validation_failed"]
+    assert "does not exist" in events[1]["details"]["reason"]
+    assert events[1]["created_at"] is not None
+
+
+@pytest.mark.integration
+def test_audit_trail_for_stale_approval(conn):
+    validate_and_save_proposal(conn, make_proposal("P3", "N01"))
+    conn.execute("UPDATE nurses SET state_version = state_version + 1 WHERE nurse_id = 'N01'")
+    approval.approve_proposal(conn, "P3", "Reviewer 1")
+    events = database.list_audit_events(conn, "P3")
+    assert events[-1]["action"] == "approval_failed_stale"
+    assert events[-1]["details"]["saved_version"] == 1
+    assert events[-1]["details"]["current_version"] == 2
+
+
+@pytest.mark.integration
+def test_audit_trail_for_repeated_approval_and_rejection(conn):
+    validate_and_save_proposal(conn, make_proposal("P4", "N01"))
+    approval.approve_proposal(conn, "P4", "Reviewer 1")
+    approval.approve_proposal(conn, "P4", "Reviewer 1")
+    assert database.list_audit_events(conn, "P4")[-1]["action"] == "approval_blocked"
+
+    validate_and_save_proposal(conn, make_proposal("P5", "N03"))
+    approval.reject_proposal(conn, "P5", "Reviewer 1", "not needed")
+    assert database.list_audit_events(conn, "P5")[-1]["action"] == "reviewer_rejected"
+
+
+@pytest.mark.integration
+def test_database_constraints_block_approving_an_invalid_proposal(conn):
+    """Even raw SQL cannot mark an invalid proposal 'approved' (CHECK constraint)."""
+    import psycopg
+    validate_and_save_proposal(conn, make_proposal("P6", "N02"))
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("UPDATE proposals SET status = 'approved' WHERE proposal_id = 'P6'")
+
+
+@pytest.mark.integration
+def test_duplicate_proposal_id_is_refused(conn):
+    validate_and_save_proposal(conn, make_proposal("P7", "N01"))
+    with pytest.raises(ValueError):
+        validate_and_save_proposal(conn, make_proposal("P7", "N03"))
+
+
+
+========================================
+FILE: tests\test_schema.py
+========================================
+"""PostgreSQL integration tests for the hospital-wide schema (migrations 001-002) and seed.
+
+Each test proves that the DATABASE ITSELF refuses an invalid state, independent of any
+Python validation. All run against the isolated test database (see conftest.py).
+"""
+
+import psycopg
+import pytest
+
+from scripts import migrate
+from scripts.db_tools import apply_seed, row_counts
+
+pytestmark = pytest.mark.integration
+
+errors = psycopg.errors
+
+
+# ------------------------------------------------------------------ small helpers
+
+def add_bundle_proposal(conn, proposal_id, patient_id="PT-001", incident_id="INC-001"):
+    conn.execute(
+        """
+        INSERT INTO proposals (proposal_id, incident_description, proposed_nurse_id,
+                               validation_valid, validation_reason, state_version_used,
+                               status, proposal_kind, incident_id, patient_id)
+        VALUES (%s, 'fictional bundle', NULL, TRUE, 'ok', NULL,
+                'pending_review', 'bundle', %s, %s)
+        """,
+        (proposal_id, incident_id, patient_id),
+    )
+
+
+def add_allocation(conn, proposal_id, patient_id="PT-001", incident_id="INC-001", hospital_id="H01"):
+    add_bundle_proposal(conn, proposal_id, patient_id, incident_id)
+    return conn.execute(
+        """
+        INSERT INTO allocations (hospital_id, incident_id, patient_id, proposal_id)
+        VALUES (%s, %s, %s, %s) RETURNING allocation_id
+        """,
+        (hospital_id, incident_id, patient_id, proposal_id),
+    ).fetchone()["allocation_id"]
+
+
+def add_bed_item(conn, allocation_id, bed_id, hospital_id="H01"):
+    conn.execute(
+        """
+        INSERT INTO allocation_items (allocation_id, hospital_id, resource_type, bed_id)
+        VALUES (%s, %s, 'bed', %s)
+        """,
+        (allocation_id, hospital_id, bed_id),
+    )
+
+
+# ------------------------------------------------------------- migrations and seed
+
+def test_migrations_are_recorded_and_repeatable(conn):
+    versions = [r["version"] for r in
+                conn.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()]
+    assert versions == ["001_nurse_only_baseline.sql", "002_hospital_wide.sql"]
+    assert migrate.apply_migrations(conn) == []          # nothing pending
+
+
+def test_edited_migration_is_detected(conn):
+    name = "002_hospital_wide.sql"
+    real = migrate.checksum_of(migrate.MIGRATIONS_DIR / name)
+    conn.execute("UPDATE schema_migrations SET checksum = 'tampered' WHERE version = %s", (name,))
+    try:
+        with pytest.raises(RuntimeError, match="edited after it was applied"):
+            migrate.apply_migrations(conn)
+    finally:
+        conn.execute("UPDATE schema_migrations SET checksum = %s WHERE version = %s", (real, name))
+
+
+def test_seed_row_counts(conn):
+    counts = row_counts(conn)
+    expected = {"hospitals": 2, "wards": 6, "beds": 25, "nurses": 6, "doctors": 6,
+                "equipment_types": 4, "equipment_units": 8, "patients": 3,
+                "incidents": 2, "incident_patients": 3, "policy_settings": 3,
+                "proposals": 0, "allocations": 0, "audit_logs": 0}
+    for table, n in expected.items():
+        assert counts[table] == n, table
+
+
+def test_seed_has_realistic_shortages(conn):
+    beds = {r["bed_id"]: r["status"] for r in conn.execute("SELECT bed_id, status FROM beds").fetchall()}
+    assert beds["B-H01-ED-06"] == "out_of_service"
+    assert beds["B-H02-GEN-04"] == "cleaning"
+    assert sum(1 for s in beds.values() if s == "free") == 23
+    unit = conn.execute("SELECT status FROM equipment_units WHERE unit_id = 'VENT-H01-02'").fetchone()
+    assert unit["status"] == "maintenance"
+
+
+def test_seed_is_repeatable_and_never_overwrites(conn):
+    conn.execute("UPDATE beds SET status = 'occupied' WHERE bed_id = 'B-H01-ED-01'")
+    before = row_counts(conn)
+    apply_seed(conn)
+    assert row_counts(conn) == before
+    status = conn.execute("SELECT status FROM beds WHERE bed_id = 'B-H01-ED-01'").fetchone()["status"]
+    assert status == "occupied"
+
+
+# ---------------------------------------------------- hospital / ward / bed integrity
+
+def test_resource_cannot_use_a_ward_from_another_hospital(conn):
+    with pytest.raises(errors.ForeignKeyViolation):
+        conn.execute(
+            "INSERT INTO equipment_units (unit_id, type_id, hospital_id, ward_id) "
+            "VALUES ('E-X', 'ventilator', 'H02', 'W-H01-ICU')"
+        )
+
+
+def test_ward_capacity_is_enforced(conn):
+    with pytest.raises(errors.RaiseException, match="at capacity"):
+        conn.execute(
+            "INSERT INTO beds (bed_id, hospital_id, ward_id, bed_type) "
+            "VALUES ('B-EXTRA', 'H01', 'W-H01-ICU', 'icu')"
+        )
+
+
+def test_bed_type_must_match_ward_type(conn):
+    conn.execute("DELETE FROM beds WHERE bed_id = 'B-H01-GEN-06'")      # make room first
+    with pytest.raises(errors.RaiseException, match="does not match"):
+        conn.execute(
+            "INSERT INTO beds (bed_id, hospital_id, ward_id, bed_type) "
+            "VALUES ('B-WRONG', 'H01', 'W-H01-GEN', 'icu')"
+        )
+    conn.execute(      # the correct type fits in the free slot
+        "INSERT INTO beds (bed_id, hospital_id, ward_id, bed_type) "
+        "VALUES ('B-H01-GEN-06', 'H01', 'W-H01-GEN', 'general')"
+    )
+
+
+def test_invalid_bed_status_is_refused(conn):
+    with pytest.raises(errors.CheckViolation):
+        conn.execute("UPDATE beds SET status = 'teleported' WHERE bed_id = 'B-H01-ED-01'")
+
+
+def test_only_fictional_patients_can_be_stored(conn):
+    with pytest.raises(errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO patients (patient_id, display_name, is_fictional) "
+            "VALUES ('PT-REAL', 'Not fictional', FALSE)"
+        )
+
+
+# ------------------------------------------------------------------- allocations
+
+def test_one_active_allocation_per_patient(conn):
+    add_allocation(conn, "PB1", patient_id="PT-001")
+    add_bundle_proposal(conn, "PB2", patient_id="PT-001")
+    with pytest.raises(errors.UniqueViolation):
+        conn.execute(
+            "INSERT INTO allocations (hospital_id, incident_id, patient_id, proposal_id) "
+            "VALUES ('H01', 'INC-001', 'PT-001', 'PB2')"
+        )
+
+
+def test_patient_must_belong_to_the_incident(conn):
+    add_bundle_proposal(conn, "PB1", patient_id="PT-003", incident_id="INC-002")  # valid pairing
+    with pytest.raises(errors.ForeignKeyViolation):      # PT-003 is not part of INC-001
+        conn.execute(
+            "INSERT INTO allocations (hospital_id, incident_id, patient_id, proposal_id) "
+            "VALUES ('H01', 'INC-001', 'PT-003', 'PB1')"
+        )
+
+
+def test_active_allocation_must_not_have_an_end_time(conn):
+    add_bundle_proposal(conn, "PB1")
+    with pytest.raises(errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO allocations (hospital_id, incident_id, patient_id, proposal_id, status) "
+            "VALUES ('H01', 'INC-001', 'PT-001', 'PB1', 'released')"      # released but no ended_at
+        )
+
+
+def test_same_bed_cannot_be_actively_allocated_twice(conn):
+    first = add_allocation(conn, "PB1", patient_id="PT-001")
+    second = add_allocation(conn, "PB2", patient_id="PT-002")
+    add_bed_item(conn, first, "B-H01-ICU-01")
+    with pytest.raises(errors.UniqueViolation):
+        add_bed_item(conn, second, "B-H01-ICU-01")
+
+    # Once the first item is released, the bed can be allocated again.
+    conn.execute("UPDATE allocation_items SET status = 'released' WHERE allocation_id = %s", (first,))
+    add_bed_item(conn, second, "B-H01-ICU-01")
+
+
+def test_same_equipment_unit_cannot_be_actively_allocated_twice(conn):
+    first = add_allocation(conn, "PB1", patient_id="PT-001")
+    second = add_allocation(conn, "PB2", patient_id="PT-002")
+    sql = ("INSERT INTO allocation_items (allocation_id, hospital_id, resource_type, equipment_unit_id) "
+           "VALUES (%s, 'H01', 'equipment', 'VENT-H01-01')")
+    conn.execute(sql, (first,))
+    with pytest.raises(errors.UniqueViolation):
+        conn.execute(sql, (second,))
+
+
+def test_an_allocation_has_at_most_one_active_bed(conn):
+    allocation = add_allocation(conn, "PB1")
+    add_bed_item(conn, allocation, "B-H01-ICU-01")
+    with pytest.raises(errors.UniqueViolation):
+        add_bed_item(conn, allocation, "B-H01-ICU-02")
+
+
+def test_allocated_resource_must_belong_to_the_allocation_hospital(conn):
+    allocation = add_allocation(conn, "PB1")                    # a hospital H01 allocation
+    with pytest.raises(errors.ForeignKeyViolation):             # bed B-H02-ICU-01 belongs to H02
+        add_bed_item(conn, allocation, "B-H02-ICU-01", hospital_id="H01")
+
+
+def test_allocation_item_must_fill_exactly_the_matching_resource_column(conn):
+    allocation = add_allocation(conn, "PB1")
+    with pytest.raises(errors.CheckViolation):                  # type 'bed' but a doctor given
+        conn.execute(
+            "INSERT INTO allocation_items (allocation_id, hospital_id, resource_type, doctor_id) "
+            "VALUES (%s, 'H01', 'bed', 'D01')", (allocation,))
+    with pytest.raises(errors.CheckViolation):                  # type 'bed' but nothing given
+        conn.execute(
+            "INSERT INTO allocation_items (allocation_id, hospital_id, resource_type) "
+            "VALUES (%s, 'H01', 'bed')", (allocation,))
+
+
+# ---------------------------------------------------------------------- proposals
+
+def test_bundle_proposal_needs_incident_and_patient(conn):
+    with pytest.raises(errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO proposals (proposal_id, incident_description, validation_valid, "
+            "validation_reason, status, proposal_kind) "
+            "VALUES ('PB1', 'x', TRUE, 'ok', 'pending_review', 'bundle')"
+        )
+
+
+def test_nurse_only_proposal_still_needs_a_nurse(conn):
+    with pytest.raises(errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO proposals (proposal_id, incident_description, validation_valid, "
+            "validation_reason, state_version_used, status) "
+            "VALUES ('PN1', 'x', TRUE, 'ok', 1, 'pending_review')"
+        )
+
+
+def test_proposal_items_can_name_resources_that_do_not_exist(conn):
+    add_bundle_proposal(conn, "PB1")
+    conn.execute(      # the AI invented this bed; it must still be storable for auditing
+        "INSERT INTO proposal_items (proposal_id, resource_type, resource_id) "
+        "VALUES ('PB1', 'bed', 'B-DOES-NOT-EXIST')"
+    )
+    with pytest.raises(errors.UniqueViolation):     # but the same item twice is refused
+        conn.execute(
+            "INSERT INTO proposal_items (proposal_id, resource_type, resource_id) "
+            "VALUES ('PB1', 'bed', 'B-DOES-NOT-EXIST')"
+        )
+
+
+def test_reviewer_can_record_a_revision_request(conn):
+    add_bundle_proposal(conn, "PB1")
+    conn.execute(
+        "INSERT INTO approvals (proposal_id, reviewer, decision, reason) "
+        "VALUES ('PB1', 'Reviewer 1', 'revision_requested', 'Please try another ward')"
+    )
+    conn.execute("UPDATE proposals SET status = 'superseded' WHERE proposal_id = 'PB1'")
+
+
+# -------------------------------------------------------------------- audit trail
+
+def test_audit_logs_are_append_only(conn):
+    conn.execute("INSERT INTO audit_logs (action, actor, entity_type, entity_id) "
+                 "VALUES ('test_event', 'tester', 'bed', 'B-H01-ED-01')")
+    with pytest.raises(errors.RaiseException, match="append-only"):
+        conn.execute("UPDATE audit_logs SET action = 'changed'")
+    with pytest.raises(errors.RaiseException, match="append-only"):
+        conn.execute("DELETE FROM audit_logs")
+    assert conn.execute("SELECT count(*) AS n FROM audit_logs").fetchone()["n"] == 1
+
+
+
+========================================
+FILE: tests\test_validator.py
+========================================
+"""Unit tests for the validator. No database needed."""
+
+from backend.hospital_state import is_state_current
+from backend.validator import validate_against_record
+from tests.conftest import make_proposal
+
+AVAILABLE_A = {"nurse_id": "N01", "name": "Person A", "available": True, "department": "Emergency", "state_version": 1}
+UNAVAILABLE_B = {"nurse_id": "N02", "name": "Person B", "available": False, "department": "ICU", "state_version": 1}
+AVAILABLE_C = {"nurse_id": "N03", "name": "Person C", "available": True, "department": "Emergency", "state_version": 1}
+
+
+def test_available_person_a_is_valid():
+    result = validate_against_record(make_proposal("P1", "N01"), AVAILABLE_A)
+    assert result.valid is True
+    assert result.state_version == 1
+    assert result.nurse_id == "N01"
+
+
+def test_unavailable_person_b_is_invalid():
+    result = validate_against_record(make_proposal("P2", "N02"), UNAVAILABLE_B)
+    assert result.valid is False
+    assert "unavailable" in result.reason
+
+
+def test_available_person_c_is_valid():
+    result = validate_against_record(make_proposal("P3", "N03"), AVAILABLE_C)
+    assert result.valid is True
+
+
+def test_nonexistent_nurse_is_invalid_with_distinct_reason():
+    result = validate_against_record(make_proposal("P4", "N99"), None)
+    assert result.valid is False
+    assert "does not exist" in result.reason
+    assert result.state_version is None
+
+
+def test_nonexistent_and_unavailable_have_different_reasons():
+    missing = validate_against_record(make_proposal("P5", "N99"), None)
+    busy = validate_against_record(make_proposal("P6", "N02"), UNAVAILABLE_B)
+    assert missing.reason != busy.reason
+
+
+def test_blank_nurse_id_is_invalid():
+    result = validate_against_record(make_proposal("P7", "   "), None)
+    assert result.valid is False
+    assert "empty" in result.reason
+
+
+def test_blank_incident_description_is_invalid():
+    result = validate_against_record(make_proposal("P8", "N01", incident="  "), AVAILABLE_A)
+    assert result.valid is False
+
+
+def test_ai_supplied_state_version_is_ignored():
+    # The AI tries to smuggle in a version. It is dropped; the result uses the database value.
+    from backend.schemas import ProposalInput
+    proposal = ProposalInput(proposal_id="P9", incident_description="x",
+                             proposed_nurse_id="N01", state_version=999)
+    assert not hasattr(proposal, "state_version")
+    assert validate_against_record(proposal, AVAILABLE_A).state_version == 1
+
+
+def test_is_state_current():
+    assert is_state_current(1, 1) is True
+    assert is_state_current(1, 2) is False
+    assert is_state_current(None, 1) is False
+    assert is_state_current(1, None) is False
+
+
+
+========================================
+FILE: tests\__init__.py
+========================================

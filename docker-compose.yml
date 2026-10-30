@@ -1,0 +1,45 @@
+# PostgreSQL for the CrisisGuard AI demo (fictional data only).
+# Values come from your local .env file (copy .env.example to .env first).
+#
+# Three different things live here - do not mix them up:
+#   container : the running PostgreSQL program (can be deleted and recreated safely)
+#   volume    : the disk storage holding the data (survives container restarts)
+#   schema    : the tables, created by migrations (python -m scripts.init_db), not by Docker
+services:
+  db:
+    image: postgres:16
+    container_name: crisisguard-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - crisisguard_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    container_name: crisisguard-app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - ./scripts:/app/scripts
+    command: sh -c "python -m scripts.init_db && uvicorn backend.api:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  crisisguard_pgdata:
